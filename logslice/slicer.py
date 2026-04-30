@@ -25,7 +25,15 @@ def slice_logs(
 
     Yields:
         Log lines (with newline stripped) within the specified range.
+
+    Raises:
+        ValueError: If start is later than end.
     """
+    if start is not None and end is not None and start > end:
+        raise ValueError(
+            f"start ({start!r}) must not be later than end ({end!r})"
+        )
+
     in_range = False
     pending_continuation: list[str] = []
 
