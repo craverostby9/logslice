@@ -1,57 +1,64 @@
-"""High-level pipeline that wires slicer, formatter, writer, and stats together."""
+"""High-level pipeline that wires source → slice → filter → sample → format → write."""
 
-from datetime import datetime
-from typing import Iterable, Optional
+from typing import Iterable, Iterator, Optional
 
+from logslice.filter import filter_lines
 from logslice.formatter import format_lines
-from logslice.parser import parse_timestamp
+from logslice.sampler import sample_lines
 from logslice.slicer import slice_logs
-from logslice.stats import SliceStats
+from logslice.stats import SliceStats, record_match, record_parse_error, record_read, record_skip
 from logslice.writer import write_output
+
+
+def _instrumented_source(
+    source: Iterable[str],
+    stats: SliceStats,
+) -> Iterator[str]:
+    """Yield lines from *source* while updating read counters in *stats*."""
+    for line in source:
+        record_read(stats, line)
+        yield line
 
 
 def run(
     source: Iterable[str],
-    start: Optional[datetime] = None,
-    end: Optional[datetime] = None,
-    fmt: str = "plain",
-    output_path: Optional[str] = None,
+    *,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    include: Optional[str] = None,
+    exclude: Optional[str] = None,
+    ignore_case: bool = False,
+    sample_rate: Optional[int] = None,
+    output_format: str = "plain",
     line_numbers: bool = False,
-    source_path: Optional[str] = None,
-) -> SliceStats:
-    """Execute the full logslice pipeline and return collected statistics.
+    output: Optional[str] = None,
+    stats: Optional[SliceStats] = None,
+) -> int:
+    """Execute the full logslice pipeline and return the number of lines written.
 
-    Args:
-        source:      Iterable of raw log lines.
-        start:       Inclusive start of the time window.
-        end:         Inclusive end of the time window.
-        fmt:         Output format passed to :func:`format_lines`.
-        output_path: File path for output; ``None`` means stdout.
-        line_numbers: Whether to include line numbers in formatted output.
-        source_path: Label used in stats (e.g. the filename).
-
-    Returns:
-        A populated :class:`~logslice.stats.SliceStats` instance.
+    Parameters
+    ----------
+    source:       Iterable of raw log lines (e.g. open file handle).
+    start/end:    ISO-8601 timestamp strings for the time slice window.
+    include:      Regex pattern — keep only matching lines.
+    exclude:      Regex pattern — drop matching lines.
+    ignore_case:  Case-insensitive regex matching.
+    sample_rate:  Keep every *N*-th line (``None`` = keep all).
+    output_format: One of ``plain``, ``jsonl``, ``json``.
+    line_numbers: Prefix output lines with their original line number.
+    output:       File path for output, or ``None`` for stdout.
+    stats:        Optional :class:`SliceStats` instance for instrumentation.
     """
-    stats = SliceStats(source_path=source_path, output_path=output_path)
+    if stats is None:
+        stats = SliceStats()
 
-    def _instrumented_source() -> Iterable[str]:
-        for line in source:
-            stats.record_read()
-            ts = parse_timestamp(line)
-            if ts is None and line.strip():
-                stats.record_parse_error()
-            yield line
+    pipeline: Iterable[str] = _instrumented_source(source, stats)
+    pipeline = slice_logs(pipeline, start=start, end=end)
+    pipeline = filter_lines(pipeline, include=include, exclude=exclude, ignore_case=ignore_case)
 
-    matched_lines = []
-    for line in slice_logs(_instrumented_source(), start=start, end=end):
-        ts = parse_timestamp(line)
-        stats.record_match(ts)
-        matched_lines.append(line)
+    if sample_rate is not None:
+        pipeline = sample_lines(pipeline, every_nth=sample_rate)
 
-    stats.lines_skipped = stats.total_lines_read - stats.lines_matched
+    pipeline = format_lines(pipeline, fmt=output_format, line_numbers=line_numbers)
 
-    formatted = list(format_lines(iter(matched_lines), fmt=fmt, line_numbers=line_numbers))
-    write_output(iter(formatted), output_path=output_path)
-
-    return stats
+    return write_output(pipeline, path=output)
