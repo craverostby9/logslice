@@ -1,91 +1,88 @@
-"""Composite transform pipeline applied to filtered log lines."""
+"""Compose and apply the full transform pipeline to a line iterator."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, Iterator, List, Optional
+from typing import Iterable, Iterator, Optional
 
-from logslice.contextualizer import contextualise_lines
 from logslice.deduplicator import deduplicate_lines
-from logslice.fieldextractor import extract_fields
+from logslice.filter import compile_filter, filter_lines
 from logslice.highlighter import highlight_lines
 from logslice.paginator import paginate_lines
-from logslice.projector import project_lines
 from logslice.sampler import sample_lines
+from logslice.summarizer import SummaryOptions, summarize_lines
 from logslice.truncator import truncate_lines
 
 
 @dataclass
 class TransformOptions:
-    # Sampling
-    sample_mode: Optional[str] = None      # "nth" | "reservoir"
-    sample_n: int = 1
+    # Filtering
+    include: list[str] = field(default_factory=list)
+    exclude: list[str] = field(default_factory=list)
+    ignore_case: bool = False
+
     # Deduplication
-    dedup_mode: Optional[str] = None       # "consecutive" | "global"
-    # Context lines
-    before_context: int = 0
-    after_context: int = 0
+    dedup: Optional[str] = None  # 'consecutive' | 'global'
+
+    # Sampling
+    sample_every: Optional[int] = None
+    sample_reservoir: Optional[int] = None
+
     # Truncation
     max_line_length: Optional[int] = None
     truncate_marker: str = "..."
+
     # Highlighting
-    highlight_patterns: List[str] = field(default_factory=list)
-    highlight_colour: str = "yellow"
-    # Field projection
-    project_fields: List[str] = field(default_factory=list)
-    project_separator: str = "  "
-    project_template: Optional[str] = None
+    highlight_patterns: list[tuple[str, str]] = field(default_factory=list)
+
     # Pagination
-    page_offset: int = 0
-    page_limit: Optional[int] = None
+    offset: int = 0
+    limit: Optional[int] = None
+
+    # Summary
+    summarize: bool = False
+    summary_top_n: int = 10
+    summary_group_by: Optional[str] = None
+    summary_pattern: Optional[str] = None
 
 
 def apply_transforms(
     lines: Iterable[str],
     opts: TransformOptions,
-) -> Iterator[str]:
-    """Apply all enabled transforms to *lines* in a fixed, sensible order."""
-    stream: Iterable[str] = lines
+) -> tuple[Iterator[str], Optional[object]]:
+    """Apply all enabled transforms in order.
 
-    if opts.sample_mode:
-        stream = sample_lines(stream, mode=opts.sample_mode, n=opts.sample_n)
+    Returns ``(transformed_iterator, summary_or_None)``.
+    """
+    it: Iterator[str] = iter(lines)
 
-    if opts.dedup_mode:
-        stream = deduplicate_lines(stream, mode=opts.dedup_mode)
+    if opts.include or opts.exclude:
+        compiled = compile_filter(opts.include, opts.exclude, opts.ignore_case)
+        it = filter_lines(it, compiled)
 
-    if opts.before_context or opts.after_context:
-        stream = contextualise_lines(
-            stream,
-            before=opts.before_context,
-            after=opts.after_context,
-        )
+    if opts.dedup:
+        it = deduplicate_lines(it, mode=opts.dedup)
+
+    if opts.sample_every is not None:
+        it = sample_lines(it, every_nth=opts.sample_every)
+    elif opts.sample_reservoir is not None:
+        it = sample_lines(it, reservoir=opts.sample_reservoir)
 
     if opts.max_line_length is not None:
-        stream = truncate_lines(
-            stream,
-            max_length=opts.max_line_length,
-            marker=opts.truncate_marker,
-        )
-
-    if opts.project_fields:
-        stream = project_lines(
-            stream,
-            opts.project_fields,
-            separator=opts.project_separator,
-            template=opts.project_template,
-        )
+        it = truncate_lines(it, opts.max_line_length, marker=opts.truncate_marker)
 
     if opts.highlight_patterns:
-        stream = highlight_lines(
-            stream,
-            patterns=opts.highlight_patterns,
-            colour=opts.highlight_colour,
+        it = highlight_lines(it, opts.highlight_patterns)
+
+    it = paginate_lines(it, offset=opts.offset, limit=opts.limit)
+
+    summary = None
+    if opts.summarize:
+        s_opts = SummaryOptions(
+            top_n=opts.summary_top_n,
+            group_by_field=opts.summary_group_by,
+            count_pattern=opts.summary_pattern,
         )
+        it, summary = summarize_lines(it, s_opts)
 
-    stream = paginate_lines(
-        stream,
-        offset=opts.page_offset,
-        limit=opts.page_limit,
-    )
-
-    yield from stream
+    return it, summary
