@@ -1,147 +1,143 @@
-"""Compose and apply a chain of line-level transforms.
-
-This module acts as the central wiring point that builds a single generator
-pipeline from individual transform options so that the pipeline module only
-needs to call :func:`apply_transforms`.
-"""
+"""Compose all optional transformation steps into a single pipeline pass."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, Iterator, List, Optional
+from typing import Iterable, Iterator
 
-from logslice.anonymizer import AnonymizeOptions, anonymize_lines
-from logslice.classifier import ClassifyOptions, classify_lines
-from logslice.contextualizer import contextualise_lines
-from logslice.deduplicator import deduplicate_lines
 from logslice.filter import compile_filter, filter_lines
-from logslice.highlighter import highlight_lines
-from logslice.leveler import LevelOptions, filter_by_level
-from logslice.paginator import paginate_lines
-from logslice.projector import project_lines
 from logslice.sampler import sample_lines
-from logslice.splitter import SplitOptions, iter_split
+from logslice.deduplicator import deduplicate_lines
 from logslice.truncator import truncate_lines
+from logslice.highlighter import highlight_lines
+from logslice.paginator import paginate_lines
+from logslice.leveler import LevelOptions, filter_by_level
+from logslice.anonymizer import AnonymizeOptions, anonymize_lines
+from logslice.contextualizer import contextualise_lines
+from logslice.projector import project_lines
+from logslice.classifier import ClassifyOptions, classify_lines
+from logslice.archiver import ArchiveOptions
 
 
 @dataclass
 class TransformOptions:
-    # filtering
-    include: Optional[List[str]] = None
-    exclude: Optional[List[str]] = None
+    # --- filtering ---
+    include: list[str] = field(default_factory=list)
+    exclude: list[str] = field(default_factory=list)
     ignore_case: bool = False
-    level: Optional[LevelOptions] = None
-    # deduplication
-    dedup: Optional[str] = None  # "consecutive" | "global"
-    # sampling
-    sample_n: Optional[int] = None
-    sample_mode: str = "nth"
-    sample_seed: Optional[int] = None
-    # context
-    before: int = 0
-    after: int = 0
-    # truncation
-    max_width: Optional[int] = None
+
+    # --- level filtering ---
+    level: LevelOptions | None = None
+
+    # --- sampling ---
+    sample_every: int | None = None
+    sample_reservoir: int | None = None
+
+    # --- deduplication ---
+    dedup: bool = False
+    dedup_global: bool = False
+
+    # --- context ---
+    before_context: int = 0
+    after_context: int = 0
+
+    # --- truncation ---
+    max_line_length: int | None = None
     truncate_marker: str = "..."
-    # pagination
-    offset: int = 0
-    limit: Optional[int] = None
-    # projection
-    fields: Optional[List[str]] = None
-    field_sep: str = "\t"
-    # anonymisation
-    anonymize: Optional[AnonymizeOptions] = None
-    # classification
-    classify: Optional[ClassifyOptions] = None
-    # splitting (bucket filter — only lines in *keep_buckets* pass through)
-    split: Optional[SplitOptions] = None
-    keep_buckets: Optional[List[str]] = None
-    # highlighting
-    highlight: Optional[List[str]] = None
+
+    # --- projection ---
+    fields: list[str] = field(default_factory=list)
+    field_separator: str = "\t"
+
+    # --- classification ---
+    classify: ClassifyOptions | None = None
+
+    # --- highlighting ---
+    highlight_patterns: list[str] = field(default_factory=list)
     highlight_colour: str = "yellow"
+
+    # --- pagination ---
+    offset: int = 0
+    limit: int | None = None
+
+    # --- anonymization ---
+    anonymize: AnonymizeOptions | None = None
+
+    # --- archiving ---
+    archive: ArchiveOptions | None = None
 
 
 def apply_transforms(
     lines: Iterable[str],
-    options: Optional[TransformOptions] = None,
+    opts: TransformOptions | None = None,
 ) -> Iterator[str]:
-    """Apply all enabled transforms in a fixed, sensible order."""
-    if options is None:
-        options = TransformOptions()
+    """Apply all enabled transforms to *lines* in a fixed, sensible order."""
+    if opts is None:
+        yield from lines
+        return
 
     stream: Iterable[str] = lines
 
-    # 1. level filtering
-    if options.level is not None:
-        stream = filter_by_level(stream, options.level)
+    # 1. level filter
+    if opts.level is not None:
+        stream = filter_by_level(stream, opts.level)
 
-    # 2. keyword filtering
-    if options.include or options.exclude:
-        f = compile_filter(
-            include=options.include or [],
-            exclude=options.exclude or [],
-            ignore_case=options.ignore_case,
-        )
+    # 2. include / exclude
+    if opts.include or opts.exclude:
+        f = compile_filter(opts.include, opts.exclude, opts.ignore_case)
         stream = filter_lines(stream, f)
 
-    # 3. anonymisation
-    if options.anonymize is not None:
-        stream = anonymize_lines(stream, options.anonymize)
+    # 3. anonymize before any output
+    if opts.anonymize is not None:
+        stream = anonymize_lines(stream, opts.anonymize)
 
-    # 4. deduplication
-    if options.dedup:
-        stream = deduplicate_lines(stream, mode=options.dedup)
-
-    # 5. context lines
-    if options.before or options.after:
+    # 4. context lines
+    if opts.before_context or opts.after_context:
         stream = contextualise_lines(
-            stream, before=options.before, after=options.after
+            stream,
+            before=opts.before_context,
+            after=opts.after_context,
         )
+
+    # 5. deduplication
+    if opts.dedup or opts.dedup_global:
+        stream = deduplicate_lines(stream, global_dedup=opts.dedup_global)
 
     # 6. sampling
-    if options.sample_n is not None:
-        stream = sample_lines(
-            stream,
-            n=options.sample_n,
-            mode=options.sample_mode,
-            seed=options.sample_seed,
-        )
+    if opts.sample_every is not None:
+        stream = sample_lines(stream, every_nth=opts.sample_every)
+    elif opts.sample_reservoir is not None:
+        stream = sample_lines(stream, reservoir=opts.sample_reservoir)
 
-    # 7. splitting / bucket filtering
-    if options.split is not None and options.keep_buckets is not None:
-        keep = set(options.keep_buckets)
-        stream = (
-            line for bucket, line in iter_split(stream, options.split)
-            if bucket in keep
-        )
-
-    # 8. classification (attaches label prefix — optional downstream use)
-    if options.classify is not None:
-        stream = classify_lines(stream, options.classify)
-
-    # 9. projection
-    if options.fields:
-        stream = project_lines(
-            stream, fields=options.fields, separator=options.field_sep
-        )
-
-    # 10. truncation
-    if options.max_width is not None:
+    # 7. truncation
+    if opts.max_line_length is not None:
         stream = truncate_lines(
             stream,
-            max_width=options.max_width,
-            marker=options.truncate_marker,
+            max_length=opts.max_line_length,
+            marker=opts.truncate_marker,
         )
 
-    # 11. highlighting
-    if options.highlight:
+    # 8. field projection
+    if opts.fields:
+        stream = project_lines(
+            stream,
+            fields=opts.fields,
+            separator=opts.field_separator,
+        )
+
+    # 9. classification
+    if opts.classify is not None:
+        stream = classify_lines(stream, opts.classify)
+
+    # 10. highlighting
+    if opts.highlight_patterns:
         stream = highlight_lines(
             stream,
-            patterns=options.highlight,
-            colour=options.highlight_colour,
+            patterns=opts.highlight_patterns,
+            colour=opts.highlight_colour,
         )
 
-    # 12. pagination (always last so counts are post-filter)
-    stream = paginate_lines(stream, offset=options.offset, limit=options.limit)
+    # 11. pagination (always last before yield)
+    stream = paginate_lines(stream, offset=opts.offset, limit=opts.limit)
 
     yield from stream
